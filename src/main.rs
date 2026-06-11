@@ -487,13 +487,14 @@ mod tests {
 
     /// Exhaustive sweep: every one of the 256 Wolfram rules, naive vs bitpacked.
     /// Catches rule-table or neighborhood-encoding errors in rules the sampled tests skip.
-    /// Width 65 spans two words so cross-word splicing runs for every rule; 32 steps lets
-    /// the pattern reach both edges from the center (cell 32, growth 1 cell per side per
-    /// generation), exercising both boundary conditions.
+    /// Width 65 spans two words so cross-word splicing runs for every rule. 64 steps: the
+    /// pattern reaches both edges at generation 32 (center cell 32, growth 1 cell per side
+    /// per generation), leaving 32 post-edge-contact generations where a boundary splice
+    /// bug would corrupt later rows.
     #[test]
     fn test_all_256_rules() {
         for rule in 0..=255u8 {
-            compare_implementations(rule, 65, 32);
+            compare_implementations(rule, 65, 64);
         }
     }
 
