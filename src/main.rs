@@ -24,21 +24,23 @@ struct Args {
     #[arg(long)]
     steps: u32,
 
-    /// Override width (default: 2 * steps + 1)
-    #[arg(long)]
+    /// Override width in cells, minimum 1 (default: 2 * steps + 1)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     width: Option<u32>,
 
     /// Output PNG file path
     #[arg(long)]
     output: String,
 
-    /// Skip confirmation prompt for large simulations (>10000 steps)
+    /// Skip confirmation prompt for large simulations (image buffer over 200 MB)
     #[arg(long, default_value_t = false)]
     force: bool,
 }
 
-/// Steps above this threshold trigger a confirmation prompt unless --force is set.
-const LARGE_STEP_THRESHOLD: u32 = 10_000;
+/// Image buffers larger than this many bytes (1 byte per pixel) trigger a confirmation
+/// prompt unless --force is set. 200 MB is roughly a default-width run at 10_000 steps
+/// (20_001 x 10_001 pixels).
+const LARGE_BUFFER_THRESHOLD: u64 = 200 * 1024 * 1024;
 
 fn main() {
     let args = Args::parse();
@@ -52,12 +54,17 @@ fn main() {
         })
     });
     // Height = steps + 1 because row 0 is the initial state, rows 1..=steps are computed generations.
-    let height = args.steps + 1;
+    // Checked because steps == u32::MAX would wrap height to 0.
+    let height = args.steps.checked_add(1).unwrap_or_else(|| {
+        eprintln!("Error: steps too large, height would overflow u32.");
+        std::process::exit(1);
+    });
 
-    // Guard against large allocations. Image buffer = width * height bytes (1 byte per pixel).
+    // Guard against large allocations. Image buffer = width * height bytes (1 byte per pixel),
+    // so the guard is on byte count: a huge --width with few steps must trigger it too.
     // At steps=50000 with default width, this is ~5 GB.
-    if args.steps > LARGE_STEP_THRESHOLD && !args.force {
-        let pixels = width as u64 * height as u64;
+    let pixels = width as u64 * height as u64;
+    if pixels > LARGE_BUFFER_THRESHOLD && !args.force {
         let megabytes = pixels / (1024 * 1024);
         eprintln!(
             "Warning: {} steps with width {} = {} pixels (~{} MB image buffer).",
@@ -79,10 +86,11 @@ fn main() {
 
     let rule_table = build_rule_table(args.rule);
     // Each u64 word holds 64 cells. Round up to cover all `width` cells.
-    let num_words = ((width as usize) + 63) / 64;
+    let num_words = (width as usize).div_ceil(64);
 
     // Flat image buffer: width * height bytes, pre-filled with 0xFF (white/dead).
     // Row `r` starts at index r * width. Each byte is one pixel.
+    // decode_row_to_image relies on this pre-fill: it writes only live (0x00) pixels.
     let mut img_buf: Vec<u8> = vec![0xFF; width as usize * height as usize];
 
     // Two bitpacked row buffers. Only these two exist at any time — not all generations.
@@ -111,8 +119,10 @@ fn main() {
     // Write the flat pixel buffer as a grayscale PNG (8-bit, 1 channel).
     let img = GrayImage::from_raw(width, height, img_buf)
         .expect("Failed to create image from buffer");
-    img.save(&args.output)
-        .unwrap_or_else(|e| panic!("Failed to save PNG to {}: {}", args.output, e));
+    img.save(&args.output).unwrap_or_else(|e| {
+        eprintln!("Error: failed to save PNG to {}: {}", args.output, e);
+        std::process::exit(1);
+    });
 
     let elapsed = start.elapsed();
     eprintln!(
@@ -219,14 +229,16 @@ fn compute_next_generation(
     }
 }
 
-/// Decodes a bitpacked row and writes pixel values into the flat image buffer.
+/// Decodes a bitpacked row and writes live-cell pixels into the flat image buffer.
 ///
 /// Input: `row` — bitpacked u64 words, MSB-first.
-/// Input: `img_buf` — flat pixel buffer, row-major, 1 byte per pixel.
+/// Input: `img_buf` — flat pixel buffer, row-major, 1 byte per pixel. Must be pre-filled
+///        with 0xFF (white/dead): only live cells are written, dead cells are skipped.
 /// Input: `row_idx` — which row in the image (0-based). Pixels start at img_buf[row_idx * width].
 /// Input: `width` — logical number of cells/pixels per row.
 ///
-/// Pixel mapping: bit value 1 (live) → 0x00 (black). Bit value 0 (dead) → 0xFF (white).
+/// Pixel mapping: bit value 1 (live) → 0x00 (black). Bit value 0 (dead) → untouched
+/// (stays 0xFF from the caller's pre-fill).
 ///
 /// Does not bounds-check row_idx — caller must ensure row_idx * width + width <= img_buf.len().
 fn decode_row_to_image(
@@ -236,17 +248,21 @@ fn decode_row_to_image(
     width: usize,
 ) {
     let row_offset = row_idx * width;
-    for wi in 0..row.len() {
+    for (wi, &word) in row.iter().enumerate() {
         let cell_start = wi * 64;
         if cell_start >= width {
             break;
         }
-        let word = row[wi];
+        // All-dead words need no writes at all — rows are sparse for most rules.
+        if word == 0 {
+            continue;
+        }
         let cell_end = std::cmp::min(cell_start + 64, width);
         for pos in cell_start..cell_end {
             let b = 63 - (pos % 64);
-            let alive = (word >> b) & 1;
-            img_buf[row_offset + pos] = if alive == 1 { 0x00 } else { 0xFF };
+            if (word >> b) & 1 == 1 {
+                img_buf[row_offset + pos] = 0x00;
+            }
         }
     }
 }
@@ -318,7 +334,7 @@ mod tests {
     /// This duplicates main()'s simulation logic so tests can compare row-by-row without PNG I/O.
     fn simulate_bitpacked(rule: u8, width: usize, steps: usize) -> Vec<Vec<u8>> {
         let rule_table = build_rule_table(rule);
-        let num_words = (width + 63) / 64;
+        let num_words = width.div_ceil(64);
         let mut current = vec![0u64; num_words];
         let mut next = vec![0u64; num_words];
 
@@ -382,8 +398,14 @@ mod tests {
 
     // --- Word-boundary tests ---
     // These widths are chosen to stress u64 word boundaries:
-    // 65 = 1 word + 1 bit, 127 = 2 words - 1 bit, 128 = exactly 2 words, 129 = 2 words + 1 bit.
+    // 64 = exactly 1 word (no adjacent word on either side), 65 = 1 word + 1 bit,
+    // 127 = 2 words - 1 bit, 128 = exactly 2 words, 129 = 2 words + 1 bit.
     // If cross-word bit splicing is wrong, these tests will catch it.
+
+    #[test]
+    fn test_rule30_width_64() {
+        compare_implementations(30, 64, 200);
+    }
 
     #[test]
     fn test_rule30_width_65() {
@@ -461,5 +483,45 @@ mod tests {
 
         let table = build_rule_table(110);
         assert_eq!(table, [0, 1, 1, 1, 0, 1, 1, 0]);
+    }
+
+    /// Exhaustive sweep: every one of the 256 Wolfram rules, naive vs bitpacked.
+    /// Catches rule-table or neighborhood-encoding errors in rules the sampled tests skip.
+    /// Width 65 spans two words so cross-word splicing runs for every rule. 64 steps: the
+    /// pattern reaches both edges at generation 32 (center cell 32, growth 1 cell per side
+    /// per generation), leaving 32 post-edge-contact generations where a boundary splice
+    /// bug would corrupt later rows.
+    #[test]
+    fn test_all_256_rules() {
+        for rule in 0..=255u8 {
+            compare_implementations(rule, 65, 64);
+        }
+    }
+
+    /// Verifies decode_row_to_image pixel values, row offset, and word-boundary mapping.
+    /// Failure modes covered: inverted color mapping, wrong row offset (writes landing in
+    /// adjacent image rows), and bit-position errors at the word 0 / word 1 boundary.
+    /// Live cells 0, 63, 64, 69: first and last bit of word 0, first bit of word 1, and
+    /// the last valid cell of a partial word (width 70).
+    #[test]
+    fn test_decode_row_to_image() {
+        let width = 70;
+        let live = [0usize, 63, 64, 69];
+        let mut row = vec![0u64; 2];
+        for &pos in &live {
+            set_bit(&mut row, pos);
+        }
+
+        // 3-row buffer, decoding into the middle row, so an offset error in either
+        // direction lands in a row asserted untouched below.
+        let mut img_buf = vec![0xFFu8; width * 3];
+        decode_row_to_image(&row, &mut img_buf, 1, width);
+
+        for pos in 0..width {
+            let expected = if live.contains(&pos) { 0x00 } else { 0xFF };
+            assert_eq!(img_buf[width + pos], expected, "pixel {} in decoded row", pos);
+        }
+        assert!(img_buf[..width].iter().all(|&p| p == 0xFF), "row 0 must be untouched");
+        assert!(img_buf[width * 2..].iter().all(|&p| p == 0xFF), "row 2 must be untouched");
     }
 }
